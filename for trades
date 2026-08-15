@@ -1,0 +1,43 @@
+TradeLockerApiError – Custom exception for API errors (status code + message + details).
+ReplaySummary – Dataclass for FX Replay CSV stats (rows, first/last/avg close, P&L%).
+TradeLockerSession – Dataclass storing session credentials and accounts.
+BotRun – Dataclass tracking all bot run state (position, P&L, signals, settings).
+LocalStateStore – Thread-safe JSON file persistence for sessions and runs.
+TradeLockerClient – HTTP client for the TradeLocker REST API (auth, accounts, market data, orders).
+create_app() – Flask app factory; registers these routes:
+GET / → serves the UI
+POST /api/tradelocker/session – create session + load accounts
+POST /api/tradelocker/test – alias for session creation
+GET /api/tradelocker/session/<id> – refresh/get a session
+GET /api/tradelocker/session/<id>/accounts – list accounts
+POST /api/fxreplay/test – process a CSV upload
+GET /api/fxreplay/status – returns "not supported via API"
+POST /api/bot/start – validate params, create BotRun, run sync or async
+POST /api/bot/stop – set stop event, mark stopped
+GET /api/bot/status – get one or all runs
+POST /api/bot/test – echo back test config
+Trading logic helpers:
+
+moving_average_signal() – compares fast/slow MAs → "buy"/"sell"/"hold"
+execute_bot_iteration() – fetches market snapshot, computes signal, checks stop-loss/take-profit, places orders
+run_bot_loop() – background thread loop calling execute_bot_iteration on poll_interval
+position_targets_hit() / close_position() / open_or_reverse_position() – position management
+templates/index.html
+Single-page UI with three sections:
+
+TradeLocker session form (environment, username, password, server)
+Bot start/stop form (account, symbol, strategy, execution mode, MA settings, stop-loss/take-profit) + live P&L summary grid
+FX Replay CSV upload form
+JavaScript: fetch-based form handlers, setInterval polling /api/bot/status every 5s, and live summary updates.
+
+static/styles.css
+Dark theme (#0f172a background, #1e293b cards), grid layout for forms and summary, sky-blue buttons.
+
+tests/test_app.py
+4 unit tests using a FakeTradeLockerClient:
+
+test_create_session_returns_accounts – session creation returns accounts
+test_bot_start_runs_strategy_and_records_signal – paper mode bot records buy signal and position
+test_bot_start_live_mode_places_order – live mode calls place_market_order
+test_fxreplay_csv_endpoint_summarizes_close_prices – CSV upload returns correct P&L%
+test_sessions_and_runs_persist_between_app_instances – state survives app restart via state.json
