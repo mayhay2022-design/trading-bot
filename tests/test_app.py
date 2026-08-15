@@ -1,31 +1,146 @@
 import io
 import unittest
 
-from app import create_app
+from app import TradeLockerSession, create_app
+
+
+class FakeTradeLockerClient:
+    def __init__(self):
+        self.live_order_calls = 0
+
+    def create_session(self, environment, username, password, server):
+        return TradeLockerSession(
+            session_id="session-123",
+            environment=environment,
+            username=username,
+            server=server,
+            access_token="access-token",
+            refresh_token="refresh-token",
+            accounts=[
+                {
+                    "id": 101,
+                    "name": "Primary Demo",
+                    "currency": "USD",
+                    "accNum": 123456,
+                    "accountBalance": 25000.0,
+                }
+            ],
+        )
+
+    def list_accounts(self, session):
+        return session.accounts
+
+    def get_market_snapshot(self, session, account_id, symbol, resolution, bars):
+        return {
+            "account": session.accounts[0],
+            "instrumentId": 77,
+            "symbol": symbol,
+            "tradeRouteId": "trade-route-1",
+            "closeValues": [1.00, 1.01, 1.02, 1.04, 1.08, 1.12, 1.16, 1.20],
+        }
+
+    def place_market_order(self, session, account_id, symbol, quantity, side):
+        self.live_order_calls += 1
+        return 9001
 
 
 class AppTestCase(unittest.TestCase):
     def setUp(self):
-        app = create_app()
+        self.fake_client = FakeTradeLockerClient()
+        app = create_app(trade_client=self.fake_client, run_async=False)
         app.testing = True
         self.client = app.test_client()
 
-    def test_bot_test_endpoint_returns_ready_state(self):
+    def test_create_session_returns_accounts(self):
         response = self.client.post(
-            "/api/bot/test",
-            json={"strategy": "rsi_macd", "symbol": "EURUSD", "source": "TradeLocker", "riskPercent": 1},
+            "/api/tradelocker/session",
+            json={
+                "environment": "demo",
+                "username": "user@example.com",
+                "password": "secret",
+                "server": "demo-server",
+            },
         )
 
         self.assertEqual(response.status_code, 200)
         body = response.get_json()
         self.assertTrue(body["ok"])
-        self.assertEqual(body["testRun"]["status"], "ready")
+        self.assertEqual(body["session"]["sessionId"], "session-123")
+        self.assertEqual(len(body["session"]["accounts"]), 1)
+
+    def test_bot_start_runs_strategy_and_records_signal(self):
+        self.client.post(
+            "/api/tradelocker/session",
+            json={
+                "environment": "demo",
+                "username": "user@example.com",
+                "password": "secret",
+                "server": "demo-server",
+            },
+        )
+
+        response = self.client.post(
+            "/api/bot/start",
+            json={
+                "sessionId": "session-123",
+                "accountId": 101,
+                "symbol": "EURUSD",
+                "strategy": "moving_average",
+                "executionMode": "paper",
+                "quantity": 0.01,
+                "fastPeriod": 3,
+                "slowPeriod": 5,
+                "resolution": "15m",
+                "pollInterval": 15,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["run"]["status"], "running")
+        self.assertEqual(body["run"]["latestSignal"], "buy")
+        self.assertEqual(body["run"]["executionCount"], 1)
+        self.assertEqual(body["run"]["lastExecution"]["mode"], "paper")
+
+    def test_bot_start_live_mode_places_order(self):
+        self.client.post(
+            "/api/tradelocker/session",
+            json={
+                "environment": "demo",
+                "username": "user@example.com",
+                "password": "secret",
+                "server": "demo-server",
+            },
+        )
+
+        response = self.client.post(
+            "/api/bot/start",
+            json={
+                "sessionId": "session-123",
+                "accountId": 101,
+                "symbol": "EURUSD",
+                "strategy": "moving_average",
+                "executionMode": "live",
+                "quantity": 0.01,
+                "fastPeriod": 3,
+                "slowPeriod": 5,
+                "resolution": "15m",
+                "pollInterval": 15,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["run"]["lastExecution"]["orderId"], 9001)
+        self.assertEqual(self.fake_client.live_order_calls, 1)
 
     def test_fxreplay_csv_endpoint_summarizes_close_prices(self):
         response = self.client.post(
             "/api/fxreplay/test",
             data={
-                "strategy": "rsi_macd",
+                "strategy": "moving_average",
                 "symbol": "EURUSD",
                 "file": (io.BytesIO(b"timestamp,close\n1,100\n2,110\n"), "prices.csv"),
             },

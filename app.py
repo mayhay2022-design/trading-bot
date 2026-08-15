@@ -3,10 +3,14 @@ from __future__ import annotations
 import csv
 import io
 import json
-from dataclasses import dataclass
+import os
+import threading
+import time
+from dataclasses import dataclass, field
 from statistics import mean
 from typing import Any
-from urllib import error, request
+from urllib import error, parse, request
+from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request as flask_request
 
@@ -15,6 +19,23 @@ TRADELOCKER_BASE_URLS = {
     "demo": "https://demo.tradelocker.com/backend-api",
     "live": "https://live.tradelocker.com/backend-api",
 }
+
+SUPPORTED_RESOLUTIONS = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1H": 3_600_000,
+    "4H": 14_400_000,
+    "1D": 86_400_000,
+}
+
+
+class TradeLockerApiError(Exception):
+    def __init__(self, status_code: int, message: str, details: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+        self.details = details
 
 
 @dataclass
@@ -31,87 +52,405 @@ class ReplaySummary:
         return ((self.last_close - self.first_close) / self.first_close) * 100
 
 
-def create_app() -> Flask:
+@dataclass
+class TradeLockerSession:
+    session_id: str
+    environment: str
+    username: str
+    server: str
+    access_token: str
+    refresh_token: str | None
+    accounts: list[dict[str, Any]]
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class BotRun:
+    run_id: str
+    session_id: str
+    account_id: int
+    symbol: str
+    strategy: str
+    quantity: float
+    fast_period: int
+    slow_period: int
+    resolution: str
+    poll_interval: int
+    execution_mode: str
+    status: str = "starting"
+    latest_signal: str = "hold"
+    latest_price: float | None = None
+    execution_count: int = 0
+    last_executed_signal: str | None = None
+    last_error: str | None = None
+    last_execution: dict[str, Any] | None = None
+    latest_analysis: dict[str, Any] | None = None
+    started_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    worker: threading.Thread | None = field(default=None, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runId": self.run_id,
+            "sessionId": self.session_id,
+            "accountId": self.account_id,
+            "symbol": self.symbol,
+            "strategy": self.strategy,
+            "quantity": self.quantity,
+            "fastPeriod": self.fast_period,
+            "slowPeriod": self.slow_period,
+            "resolution": self.resolution,
+            "pollInterval": self.poll_interval,
+            "executionMode": self.execution_mode,
+            "status": self.status,
+            "latestSignal": self.latest_signal,
+            "latestPrice": self.latest_price,
+            "executionCount": self.execution_count,
+            "lastError": self.last_error,
+            "lastExecution": self.last_execution,
+            "latestAnalysis": self.latest_analysis,
+            "startedAt": self.started_at,
+            "updatedAt": self.updated_at,
+        }
+
+
+class TradeLockerClient:
+    def create_session(
+        self,
+        environment: str,
+        username: str,
+        password: str,
+        server: str,
+    ) -> TradeLockerSession:
+        tokens = self._request_json(
+            "POST",
+            environment,
+            "/auth/jwt/token",
+            payload={"email": username, "password": password, "server": server},
+        )
+        access_token = tokens.get("accessToken")
+        refresh_token = tokens.get("refreshToken")
+        if not access_token:
+            raise TradeLockerApiError(502, "TradeLocker did not return an access token.")
+
+        accounts_response = self._request_json(
+            "GET",
+            environment,
+            "/auth/jwt/all-accounts",
+            access_token=access_token,
+        )
+        session = TradeLockerSession(
+            session_id=str(uuid4()),
+            environment=environment,
+            username=username,
+            server=server,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            accounts=self._normalize_accounts(accounts_response.get("accounts") or []),
+        )
+        return session
+
+    def refresh_session(self, session: TradeLockerSession) -> TradeLockerSession:
+        if not session.refresh_token:
+            raise TradeLockerApiError(401, "TradeLocker session cannot be refreshed.")
+
+        tokens = self._request_json(
+            "POST",
+            session.environment,
+            "/auth/jwt/refresh",
+            payload={"refreshToken": session.refresh_token},
+        )
+        access_token = tokens.get("accessToken")
+        refresh_token = tokens.get("refreshToken")
+        if not access_token:
+            raise TradeLockerApiError(502, "TradeLocker refresh did not return an access token.")
+
+        session.access_token = access_token
+        session.refresh_token = refresh_token or session.refresh_token
+        session.updated_at = time.time()
+        return session
+
+    def list_accounts(self, session: TradeLockerSession) -> list[dict[str, Any]]:
+        response = self._request_with_session(session, "GET", "/auth/jwt/all-accounts")
+        session.accounts = self._normalize_accounts(response.get("accounts") or [])
+        session.updated_at = time.time()
+        return session.accounts
+
+    def get_market_snapshot(
+        self,
+        session: TradeLockerSession,
+        account_id: int,
+        symbol: str,
+        resolution: str,
+        bars: int,
+    ) -> dict[str, Any]:
+        account = self._find_account(session, account_id)
+        instruments_response = self._request_with_session(
+            session,
+            "GET",
+            f"/trade/accounts/{account_id}/instruments",
+            acc_num=account["accNum"],
+        )
+        instrument = self._find_instrument(instruments_response.get("d", {}).get("instruments") or [], symbol)
+        info_route_id = self._find_route_id(instrument, "INFO")
+        trade_route_id = self._find_route_id(instrument, "TRADE")
+
+        now_ms = int(time.time() * 1000)
+        lookback_ms = resolution_to_millis(resolution) * max(bars, 10)
+        history_response = self._request_with_session(
+            session,
+            "GET",
+            "/trade/history",
+            acc_num=account["accNum"],
+            query={
+                "tradableInstrumentId": instrument["tradableInstrumentId"],
+                "routeId": info_route_id,
+                "resolution": resolution,
+                "from": now_ms - lookback_ms,
+                "to": now_ms,
+            },
+        )
+
+        close_values = extract_close_values(history_response.get("d", {}).get("barDetails") or [])
+        if len(close_values) < max(3, bars):
+            raise TradeLockerApiError(502, "TradeLocker did not return enough price history for this symbol.")
+
+        return {
+            "account": account,
+            "instrumentId": int(instrument["tradableInstrumentId"]),
+            "symbol": instrument.get("name") or symbol.upper(),
+            "tradeRouteId": trade_route_id,
+            "closeValues": close_values,
+        }
+
+    def place_market_order(
+        self,
+        session: TradeLockerSession,
+        account_id: int,
+        symbol: str,
+        quantity: float,
+        side: str,
+    ) -> int | None:
+        market_snapshot = self.get_market_snapshot(
+            session=session,
+            account_id=account_id,
+            symbol=symbol,
+            resolution="1m",
+            bars=5,
+        )
+        account = market_snapshot["account"]
+        response = self._request_with_session(
+            session,
+            "POST",
+            f"/trade/accounts/{account_id}/orders",
+            acc_num=account["accNum"],
+            payload={
+                "price": None,
+                "qty": str(quantity),
+                "routeId": market_snapshot["tradeRouteId"],
+                "side": side,
+                "tradableInstrumentId": str(market_snapshot["instrumentId"]),
+                "type": "market",
+                "validity": "IOC",
+            },
+        )
+        order_id = response.get("d", {}).get("orderId")
+        return int(order_id) if order_id is not None else None
+
+    def _request_with_session(
+        self,
+        session: TradeLockerSession,
+        method: str,
+        path: str,
+        *,
+        acc_num: int | None = None,
+        payload: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._request_json(
+                method,
+                session.environment,
+                path,
+                access_token=session.access_token,
+                acc_num=acc_num,
+                payload=payload,
+                query=query,
+            )
+        except TradeLockerApiError as exc:
+            if exc.status_code != 401 or not session.refresh_token:
+                raise
+            self.refresh_session(session)
+            return self._request_json(
+                method,
+                session.environment,
+                path,
+                access_token=session.access_token,
+                acc_num=acc_num,
+                payload=payload,
+                query=query,
+            )
+
+    def _request_json(
+        self,
+        method: str,
+        environment: str,
+        path: str,
+        *,
+        access_token: str | None = None,
+        acc_num: int | None = None,
+        payload: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if environment not in TRADELOCKER_BASE_URLS:
+            raise TradeLockerApiError(400, "Environment must be demo or live.")
+
+        url = f"{TRADELOCKER_BASE_URLS[environment]}{path}"
+        if query:
+            url = f"{url}?{parse.urlencode(query)}"
+
+        headers = {"Accept": "application/json"}
+        developer_api_key = os.getenv("TRADELOCKER_DEVELOPER_API_KEY")
+        if developer_api_key:
+            headers["developer-api-key"] = developer_api_key
+        if access_token:
+            headers["Authorization"] = f"******"
+        if acc_num is not None:
+            headers["accNum"] = str(acc_num)
+
+        body = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(payload).encode("utf-8")
+
+        api_request = request.Request(url, data=body, headers=headers, method=method)
+
+        try:
+            with request.urlopen(api_request, timeout=15) as response:
+                raw_body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="ignore")[:500]
+            raise TradeLockerApiError(exc.code, "TradeLocker request failed.", details) from exc
+        except error.URLError as exc:
+            raise TradeLockerApiError(502, f"Could not reach TradeLocker: {exc.reason}") from exc
+
+        try:
+            return json.loads(raw_body or "{}")
+        except json.JSONDecodeError as exc:
+            raise TradeLockerApiError(502, "TradeLocker returned invalid JSON.") from exc
+
+    def _normalize_accounts(self, accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized_accounts: list[dict[str, Any]] = []
+        for account in accounts:
+            try:
+                normalized_accounts.append(
+                    {
+                        "id": int(account["id"]),
+                        "name": account.get("name") or f"Account {account['id']}",
+                        "currency": account.get("currency") or "",
+                        "accNum": int(account["accNum"]),
+                        "accountBalance": float(account.get("accountBalance") or 0),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return normalized_accounts
+
+    def _find_account(self, session: TradeLockerSession, account_id: int) -> dict[str, Any]:
+        for account in session.accounts:
+            if int(account["id"]) == int(account_id):
+                return account
+        raise TradeLockerApiError(404, "TradeLocker account was not found in the active session.")
+
+    def _find_instrument(self, instruments: list[dict[str, Any]], symbol: str) -> dict[str, Any]:
+        normalized_symbol = normalize_symbol(symbol)
+        for instrument in instruments:
+            candidates = [
+                instrument.get("name"),
+                instrument.get("symbol"),
+                instrument.get("ticker"),
+            ]
+            if any(normalize_symbol(candidate) == normalized_symbol for candidate in candidates if candidate):
+                return instrument
+        raise TradeLockerApiError(404, f"TradeLocker symbol '{symbol}' was not found for this account.")
+
+    def _find_route_id(self, instrument: dict[str, Any], route_type: str) -> str:
+        for route in instrument.get("routes") or []:
+            if route.get("type") == route_type:
+                return str(route.get("id"))
+        raise TradeLockerApiError(502, f"TradeLocker did not return a {route_type} route for the symbol.")
+
+
+def create_app(
+    *,
+    trade_client: TradeLockerClient | None = None,
+    run_async: bool = True,
+) -> Flask:
     app = Flask(__name__)
+    client = trade_client or TradeLockerClient()
+    sessions: dict[str, TradeLockerSession] = {}
+    runs: dict[str, BotRun] = {}
 
     @app.get("/")
     def index() -> str:
         return render_template("index.html")
 
-    @app.post("/api/tradelocker/test")
-    def test_tradelocker_connection():
+    @app.post("/api/tradelocker/session")
+    def create_tradelocker_session():
         payload = flask_request.get_json(silent=True) or {}
         environment = payload.get("environment", "demo")
         username = (payload.get("username") or "").strip()
         password = payload.get("password") or ""
         server = (payload.get("server") or "").strip()
 
-        if environment not in TRADELOCKER_BASE_URLS:
-            return jsonify({"ok": False, "error": "Environment must be demo or live."}), 400
         if not username or not password or not server:
             return jsonify({"ok": False, "error": "Username, password, and server are required."}), 400
 
-        login_payload = json.dumps(
-            {
-                "username": username,
-                "password": password,
-                "server": server,
-            }
-        ).encode("utf-8")
+        try:
+            session = client.create_session(environment, username, password, server)
+        except TradeLockerApiError as exc:
+            return error_response(exc)
 
-        login_request = request.Request(
-            f"{TRADELOCKER_BASE_URLS[environment]}/auth/login",
-            data=login_payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
+        sessions[session.session_id] = session
+        return jsonify(
+            {
+                "ok": True,
+                "message": "TradeLocker session created.",
+                "session": serialize_session(session),
+            }
         )
+
+    @app.post("/api/tradelocker/test")
+    def test_tradelocker_connection():
+        return create_tradelocker_session()
+
+    @app.get("/api/tradelocker/session/<session_id>")
+    def get_tradelocker_session(session_id: str):
+        session = sessions.get(session_id)
+        if session is None:
+            return jsonify({"ok": False, "error": "TradeLocker session not found."}), 404
 
         try:
-            with request.urlopen(login_request, timeout=10) as response:
-                body = json.loads(response.read().decode("utf-8") or "{}")
-        except error.HTTPError as exc:
-            message = exc.read().decode("utf-8", errors="ignore") or exc.reason
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "TradeLocker rejected the login attempt.",
-                        "details": message[:500],
-                    }
-                ),
-                exc.code,
-            )
-        except error.URLError as exc:
-            return jsonify({"ok": False, "error": f"Could not reach TradeLocker: {exc.reason}"}), 502
+            client.list_accounts(session)
+        except TradeLockerApiError as exc:
+            return error_response(exc)
 
-        access_token = body.get("accessToken") or body.get("access_token")
-        refresh_token = body.get("refreshToken") or body.get("refresh_token")
+        return jsonify({"ok": True, "session": serialize_session(session)})
 
-        return jsonify(
-            {
-                "ok": True,
-                "message": "TradeLocker connection succeeded.",
-                "environment": environment,
-                "hasAccessToken": bool(access_token),
-                "hasRefreshToken": bool(refresh_token),
-            }
-        )
+    @app.get("/api/tradelocker/session/<session_id>/accounts")
+    def get_tradelocker_accounts(session_id: str):
+        session = sessions.get(session_id)
+        if session is None:
+            return jsonify({"ok": False, "error": "TradeLocker session not found."}), 404
 
-    @app.get("/api/fxreplay/status")
-    def fxreplay_status():
-        return jsonify(
-            {
-                "ok": True,
-                "supported": False,
-                "message": (
-                    "FX Replay does not publish a public API for direct third-party integrations. "
-                    "Use CSV exports from FX Replay with the replay tester below."
-                ),
-            }
-        )
+        try:
+            accounts = client.list_accounts(session)
+        except TradeLockerApiError as exc:
+            return error_response(exc)
+
+        return jsonify({"ok": True, "accounts": accounts})
 
     @app.post("/api/fxreplay/test")
     def test_fxreplay_csv():
@@ -151,29 +490,222 @@ def create_app() -> Flask:
             }
         )
 
+    @app.get("/api/fxreplay/status")
+    def fxreplay_status():
+        return jsonify(
+            {
+                "ok": True,
+                "supported": False,
+                "message": (
+                    "FX Replay does not publish a public API for direct third-party integrations. "
+                    "Use CSV exports from FX Replay with the replay tester below."
+                ),
+            }
+        )
+
+    @app.post("/api/bot/start")
+    def start_bot():
+        payload = flask_request.get_json(silent=True) or {}
+        session_id = (payload.get("sessionId") or "").strip()
+        symbol = (payload.get("symbol") or "EURUSD").strip()
+        strategy = (payload.get("strategy") or "moving_average").strip()
+        execution_mode = (payload.get("executionMode") or "paper").strip().lower()
+
+        session = sessions.get(session_id)
+        if session is None:
+            return jsonify({"ok": False, "error": "Create a TradeLocker session before starting the bot."}), 400
+
+        try:
+            account_id = int(payload.get("accountId"))
+            quantity = float(payload.get("quantity") or 0.01)
+            fast_period = int(payload.get("fastPeriod") or 5)
+            slow_period = int(payload.get("slowPeriod") or 20)
+            poll_interval = int(payload.get("pollInterval") or 15)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Account, quantity, periods, and poll interval must be valid numbers."}), 400
+
+        resolution = (payload.get("resolution") or "15m").strip()
+
+        if execution_mode not in {"paper", "live"}:
+            return jsonify({"ok": False, "error": "Execution mode must be paper or live."}), 400
+        if resolution not in SUPPORTED_RESOLUTIONS:
+            return jsonify({"ok": False, "error": "Unsupported resolution."}), 400
+        if quantity <= 0:
+            return jsonify({"ok": False, "error": "Quantity must be greater than zero."}), 400
+        if fast_period < 2 or slow_period <= fast_period:
+            return jsonify({"ok": False, "error": "Use a fast period >= 2 and a slow period larger than the fast period."}), 400
+        if poll_interval < 5 or poll_interval > 300:
+            return jsonify({"ok": False, "error": "Poll interval must be between 5 and 300 seconds."}), 400
+
+        run = BotRun(
+            run_id=str(uuid4()),
+            session_id=session_id,
+            account_id=account_id,
+            symbol=symbol,
+            strategy=strategy,
+            quantity=quantity,
+            fast_period=fast_period,
+            slow_period=slow_period,
+            resolution=resolution,
+            poll_interval=poll_interval,
+            execution_mode=execution_mode,
+        )
+        runs[run.run_id] = run
+
+        if run_async:
+            worker = threading.Thread(
+                target=run_bot_loop,
+                args=(client, sessions, run),
+                daemon=True,
+            )
+            run.worker = worker
+            worker.start()
+        else:
+            run.status = "running"
+            try:
+                execute_bot_iteration(client, sessions, run)
+            except TradeLockerApiError as exc:
+                run.status = "error"
+                run.last_error = exc.message
+
+        return jsonify({"ok": True, "message": "Bot runner started.", "run": run.to_dict()})
+
+    @app.post("/api/bot/stop")
+    def stop_bot():
+        payload = flask_request.get_json(silent=True) or {}
+        run_id = (payload.get("runId") or "").strip()
+        run = runs.get(run_id)
+        if run is None:
+            return jsonify({"ok": False, "error": "Bot run not found."}), 404
+
+        run.stop_event.set()
+        run.status = "stopped"
+        run.updated_at = time.time()
+        return jsonify({"ok": True, "message": "Bot runner stopped.", "run": run.to_dict()})
+
+    @app.get("/api/bot/status")
+    def get_bot_status():
+        run_id = (flask_request.args.get("runId") or "").strip()
+        if run_id:
+            run = runs.get(run_id)
+            if run is None:
+                return jsonify({"ok": False, "error": "Bot run not found."}), 404
+            return jsonify({"ok": True, "run": run.to_dict()})
+
+        return jsonify({"ok": True, "runs": [run.to_dict() for run in runs.values()]})
+
     @app.post("/api/bot/test")
     def test_bot_configuration():
         payload = flask_request.get_json(silent=True) or {}
-        strategy = (payload.get("strategy") or "rsi_macd").strip()
-        symbol = (payload.get("symbol") or "EURUSD").strip()
-        source = (payload.get("source") or "TradeLocker").strip()
-        risk_percent = payload.get("riskPercent") or 1
-
         return jsonify(
             {
                 "ok": True,
                 "message": "Bot test configuration saved.",
                 "testRun": {
-                    "strategy": strategy,
-                    "symbol": symbol,
-                    "source": source,
-                    "riskPercent": risk_percent,
+                    "strategy": (payload.get("strategy") or "moving_average").strip(),
+                    "symbol": (payload.get("symbol") or "EURUSD").strip(),
+                    "source": (payload.get("source") or "TradeLocker").strip(),
+                    "riskPercent": payload.get("riskPercent") or 1,
                     "status": "ready",
                 },
             }
         )
 
     return app
+
+
+def serialize_session(session: TradeLockerSession) -> dict[str, Any]:
+    return {
+        "sessionId": session.session_id,
+        "environment": session.environment,
+        "username": session.username,
+        "server": session.server,
+        "accounts": session.accounts,
+        "createdAt": session.created_at,
+        "updatedAt": session.updated_at,
+    }
+
+
+def run_bot_loop(
+    client: TradeLockerClient,
+    sessions: dict[str, TradeLockerSession],
+    run: BotRun,
+) -> None:
+    run.status = "running"
+    run.updated_at = time.time()
+    while not run.stop_event.is_set():
+        try:
+            execute_bot_iteration(client, sessions, run)
+        except TradeLockerApiError as exc:
+            run.status = "error"
+            run.last_error = exc.message
+            run.updated_at = time.time()
+            return
+
+        if run.stop_event.wait(run.poll_interval):
+            break
+
+    if run.status != "error":
+        run.status = "stopped"
+        run.updated_at = time.time()
+
+
+def execute_bot_iteration(
+    client: TradeLockerClient,
+    sessions: dict[str, TradeLockerSession],
+    run: BotRun,
+) -> None:
+    session = sessions.get(run.session_id)
+    if session is None:
+        raise TradeLockerApiError(404, "TradeLocker session is no longer available.")
+
+    bars = max(run.slow_period + 2, 25)
+    market_snapshot = client.get_market_snapshot(
+        session=session,
+        account_id=run.account_id,
+        symbol=run.symbol,
+        resolution=run.resolution,
+        bars=bars,
+    )
+    close_values = market_snapshot["closeValues"]
+    signal, fast_average, slow_average = moving_average_signal(
+        close_values,
+        fast_period=run.fast_period,
+        slow_period=run.slow_period,
+    )
+
+    run.latest_signal = signal
+    run.latest_price = round(close_values[-1], 5)
+    run.latest_analysis = {
+        "fastAverage": round(fast_average, 5),
+        "slowAverage": round(slow_average, 5),
+        "barsAnalyzed": len(close_values),
+    }
+    run.updated_at = time.time()
+
+    if signal == "hold" or signal == run.last_executed_signal:
+        return
+
+    if run.execution_mode == "live":
+        order_id = client.place_market_order(
+            session=session,
+            account_id=run.account_id,
+            symbol=run.symbol,
+            quantity=run.quantity,
+            side=signal,
+        )
+    else:
+        order_id = None
+
+    run.execution_count += 1
+    run.last_executed_signal = signal
+    run.last_execution = {
+        "side": signal,
+        "mode": run.execution_mode,
+        "orderId": order_id,
+        "price": run.latest_price,
+        "timestamp": time.time(),
+    }
 
 
 def summarize_replay_csv(content: bytes) -> ReplaySummary:
@@ -209,6 +741,55 @@ def find_close_value(row: dict[str, Any]) -> float | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def extract_close_values(bar_details: list[Any]) -> list[float]:
+    close_values: list[float] = []
+    for bar in bar_details:
+        close_value = None
+        if isinstance(bar, dict):
+            close_value = bar.get("c") if "c" in bar else bar.get("close")
+        elif isinstance(bar, list) and len(bar) >= 5:
+            close_value = bar[4]
+
+        try:
+            if close_value is not None:
+                close_values.append(float(close_value))
+        except (TypeError, ValueError):
+            continue
+    return close_values
+
+
+def moving_average_signal(
+    close_values: list[float],
+    *,
+    fast_period: int,
+    slow_period: int,
+) -> tuple[str, float, float]:
+    fast_average = mean(close_values[-fast_period:])
+    slow_average = mean(close_values[-slow_period:])
+    if fast_average > slow_average:
+        return "buy", fast_average, slow_average
+    if fast_average < slow_average:
+        return "sell", fast_average, slow_average
+    return "hold", fast_average, slow_average
+
+
+def resolution_to_millis(resolution: str) -> int:
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        raise TradeLockerApiError(400, "Unsupported resolution.")
+    return SUPPORTED_RESOLUTIONS[resolution]
+
+
+def normalize_symbol(symbol: str) -> str:
+    return symbol.replace("/", "").replace("-", "").replace("_", "").upper()
+
+
+def error_response(exc: TradeLockerApiError):
+    payload = {"ok": False, "error": exc.message}
+    if exc.details:
+        payload["details"] = exc.details
+    return jsonify(payload), exc.status_code
 
 
 app = create_app()

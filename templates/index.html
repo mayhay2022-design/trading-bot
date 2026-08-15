@@ -3,18 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trading Bot Test Console</title>
+    <title>Trading Bot Runner</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
     <main class="container">
         <section class="hero">
-            <h1>Trading Bot Test Console</h1>
-            <p>Use this starter website to validate TradeLocker connectivity, stage bot test runs, and evaluate FX Replay CSV exports.</p>
+            <h1>Trading Bot Runner</h1>
+            <p>Connect to TradeLocker, choose an account, and run a moving-average bot in paper or live mode.</p>
         </section>
 
         <section class="card">
-            <h2>1. TradeLocker connection test</h2>
+            <h2>1. TradeLocker session</h2>
             <form id="tradelocker-form">
                 <label>Environment
                     <select name="environment">
@@ -25,31 +25,51 @@
                 <label>Username <input type="email" name="username" required></label>
                 <label>Password <input type="password" name="password" required></label>
                 <label>Server <input type="text" name="server" required></label>
-                <button type="submit">Test TradeLocker</button>
+                <button type="submit">Create session</button>
             </form>
+            <p class="hint">The session and broker tokens stay only in server memory for the current process.</p>
             <pre id="tradelocker-result" class="result"></pre>
         </section>
 
         <section class="card">
-            <h2>2. Bot test setup</h2>
+            <h2>2. Start the bot</h2>
             <form id="bot-form">
-                <label>Strategy
-                    <select name="strategy">
-                        <option value="rsi_macd">RSI + MACD</option>
-                        <option value="trend_following">Trend Following</option>
-                        <option value="mean_reversion">Mean Reversion</option>
+                <label>Account
+                    <select id="account-id" name="accountId" required>
+                        <option value="">Connect to TradeLocker first</option>
                     </select>
                 </label>
                 <label>Symbol <input type="text" name="symbol" value="EURUSD" required></label>
-                <label>Source
-                    <select name="source">
-                        <option value="TradeLocker">TradeLocker</option>
-                        <option value="FX Replay CSV">FX Replay CSV</option>
+                <label>Strategy
+                    <select name="strategy">
+                        <option value="moving_average">Moving Average</option>
                     </select>
                 </label>
-                <label>Risk % <input type="number" name="riskPercent" min="0.1" max="10" step="0.1" value="1"></label>
-                <button type="submit">Save test run</button>
+                <label>Execution mode
+                    <select name="executionMode">
+                        <option value="paper">Paper</option>
+                        <option value="live">Live</option>
+                    </select>
+                </label>
+                <label>Quantity <input type="number" name="quantity" min="0.01" step="0.01" value="0.01" required></label>
+                <label>Fast period <input type="number" name="fastPeriod" min="2" step="1" value="5" required></label>
+                <label>Slow period <input type="number" name="slowPeriod" min="3" step="1" value="20" required></label>
+                <label>Resolution
+                    <select name="resolution">
+                        <option value="1m">1m</option>
+                        <option value="5m">5m</option>
+                        <option value="15m" selected>15m</option>
+                        <option value="1H">1H</option>
+                        <option value="4H">4H</option>
+                        <option value="1D">1D</option>
+                    </select>
+                </label>
+                <label>Poll interval seconds <input type="number" name="pollInterval" min="5" max="300" step="1" value="15" required></label>
+                <button type="submit">Start bot</button>
             </form>
+            <div class="actions">
+                <button id="stop-bot" type="button" disabled>Stop bot</button>
+            </div>
             <pre id="bot-result" class="result"></pre>
         </section>
 
@@ -58,7 +78,7 @@
             <p id="fxreplay-status">Checking FX Replay support...</p>
             <form id="fxreplay-form">
                 <label>Strategy
-                    <input type="text" name="strategy" value="rsi_macd" required>
+                    <input type="text" name="strategy" value="moving_average" required>
                 </label>
                 <label>Symbol
                     <input type="text" name="symbol" value="EURUSD" required>
@@ -73,23 +93,115 @@
     </main>
 
     <script>
-        async function sendJson(formId, url, resultId) {
-            const form = document.getElementById(formId);
-            form.addEventListener('submit', async (event) => {
-                event.preventDefault();
-                const data = Object.fromEntries(new FormData(form).entries());
-                const response = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data),
-                });
-                const body = await response.json();
-                document.getElementById(resultId).textContent = JSON.stringify(body, null, 2);
+        let currentSessionId = null;
+        let currentRunId = null;
+        let statusTimer = null;
+
+        function renderResult(id, payload) {
+            document.getElementById(id).textContent = JSON.stringify(payload, null, 2);
+        }
+
+        function setAccounts(accounts) {
+            const select = document.getElementById('account-id');
+            select.innerHTML = '';
+            if (!accounts.length) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = 'No accounts returned';
+                select.appendChild(option);
+                return;
+            }
+
+            accounts.forEach((account) => {
+                const option = document.createElement('option');
+                option.value = account.id;
+                option.textContent = `${account.name} (${account.accNum}) - ${account.accountBalance} ${account.currency}`;
+                select.appendChild(option);
             });
         }
 
-        sendJson('tradelocker-form', '/api/tradelocker/test', 'tradelocker-result');
-        sendJson('bot-form', '/api/bot/test', 'bot-result');
+        async function pollStatus() {
+            if (!currentRunId) {
+                return;
+            }
+
+            const response = await fetch(`/api/bot/status?runId=${encodeURIComponent(currentRunId)}`);
+            const body = await response.json();
+            renderResult('bot-result', body);
+
+            const status = body.run?.status;
+            if (status === 'stopped' || status === 'error') {
+                window.clearInterval(statusTimer);
+                statusTimer = null;
+                document.getElementById('stop-bot').disabled = true;
+            }
+        }
+
+        document.getElementById('tradelocker-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const form = event.currentTarget;
+            const response = await fetch('/api/tradelocker/session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(Object.fromEntries(new FormData(form).entries())),
+            });
+            const body = await response.json();
+            renderResult('tradelocker-result', body);
+
+            if (body.ok) {
+                currentSessionId = body.session.sessionId;
+                setAccounts(body.session.accounts || []);
+            }
+        });
+
+        document.getElementById('bot-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (!currentSessionId) {
+                renderResult('bot-result', { ok: false, error: 'Create a TradeLocker session first.' });
+                return;
+            }
+
+            const form = event.currentTarget;
+            const payload = Object.fromEntries(new FormData(form).entries());
+            payload.sessionId = currentSessionId;
+
+            const response = await fetch('/api/bot/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const body = await response.json();
+            renderResult('bot-result', body);
+
+            if (body.ok) {
+                currentRunId = body.run.runId;
+                document.getElementById('stop-bot').disabled = false;
+                if (statusTimer) {
+                    window.clearInterval(statusTimer);
+                }
+                statusTimer = window.setInterval(pollStatus, 5000);
+            }
+        });
+
+        document.getElementById('stop-bot').addEventListener('click', async () => {
+            if (!currentRunId) {
+                return;
+            }
+
+            const response = await fetch('/api/bot/stop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ runId: currentRunId }),
+            });
+            const body = await response.json();
+            renderResult('bot-result', body);
+            currentRunId = null;
+            document.getElementById('stop-bot').disabled = true;
+            if (statusTimer) {
+                window.clearInterval(statusTimer);
+                statusTimer = null;
+            }
+        });
 
         document.getElementById('fxreplay-form').addEventListener('submit', async (event) => {
             event.preventDefault();
@@ -99,7 +211,7 @@
                 body: new FormData(form),
             });
             const body = await response.json();
-            document.getElementById('fxreplay-result').textContent = JSON.stringify(body, null, 2);
+            renderResult('fxreplay-result', body);
         });
 
         fetch('/api/fxreplay/status')

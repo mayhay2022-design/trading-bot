@@ -1,11 +1,12 @@
-# Trading Bot Test Website
+# Trading Bot Runner
 
-A minimal Python website for testing a trading bot workflow with TradeLocker connectivity and FX Replay CSV-based replay evaluation.
+A minimal Python website that creates a TradeLocker session, lets you choose an account, and runs a moving-average bot in paper or live mode.
 
 ## Features
 
-- TradeLocker login connectivity check
-- Bot test configuration form
+- TradeLocker session and account loading
+- Bot start, stop, and status flow
+- Moving-average trading logic using TradeLocker market history
 - FX Replay CSV import and summary metrics
 - Lightweight Flask UI
 - Basic automated endpoint tests
@@ -40,6 +41,21 @@ python app.py
 
 Then open `http://127.0.0.1:5000`.
 
+## TradeLocker setup
+
+- Enter your TradeLocker username, password, server, and environment in the UI
+- The app stores tokens only in memory for the current Flask process
+- If your broker requires it, set `TRADELOCKER_DEVELOPER_API_KEY` before starting the app
+
+## Bot workflow
+
+1. Create a TradeLocker session
+2. Pick one of the returned accounts
+3. Choose symbol, quantity, moving-average settings, and execution mode
+4. Start the bot and monitor the latest signal from the status panel
+
+Use **paper** mode to test safely. **Live** mode attempts to place real market orders through the connected TradeLocker account.
+
 ## Test
 
 ```bash
@@ -48,5 +64,5 @@ python -m unittest discover -s tests
 
 ## Notes
 
-- TradeLocker is tested through its login API using credentials you provide in the UI.
-- FX Replay does not currently expose a public API for direct third-party app control, so this starter site uses CSV exports from FX Replay instead.
+- The built-in strategy is a simple moving-average comparison using TradeLocker history data.
+- FX Replay does not currently expose a public API for direct third-party app control, so this app uses CSV exports from FX Replay instead.
