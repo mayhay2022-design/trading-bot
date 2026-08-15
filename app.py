@@ -124,8 +124,16 @@ def create_app() -> Flask:
 
         try:
             summary = summarize_replay_csv(uploaded_file.read())
-        except ValueError as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
+        except ValueError:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "The CSV must be non-empty and include at least two rows with a close column.",
+                    }
+                ),
+                400,
+            )
 
         verdict = "pass" if summary.pnl_percent >= 0 else "review"
         return jsonify(
@@ -207,4 +215,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
