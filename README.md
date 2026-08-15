@@ -43,7 +43,7 @@ Then open `http://127.0.0.1:5000`.
 ## Test
 
 ```bash
-python -m pytest
+python -m unittest discover -s tests
 ```
 
 ## Notes
