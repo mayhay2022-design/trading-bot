@@ -7,8 +7,9 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from statistics import mean
-from typing import Any
+from typing import Any, Callable
 from urllib import error, parse, request
 from uuid import uuid4
 
@@ -78,12 +79,20 @@ class BotRun:
     resolution: str
     poll_interval: int
     execution_mode: str
+    stop_loss_percent: float = 0.0
+    take_profit_percent: float = 0.0
     status: str = "starting"
     latest_signal: str = "hold"
     latest_price: float | None = None
+    position_side: str = "flat"
+    entry_price: float | None = None
+    unrealized_pnl_percent: float = 0.0
+    realized_pnl_percent: float = 0.0
+    total_pnl_percent: float = 0.0
     execution_count: int = 0
     last_executed_signal: str | None = None
     last_error: str | None = None
+    last_exit_reason: str | None = None
     last_execution: dict[str, Any] | None = None
     latest_analysis: dict[str, Any] | None = None
     started_at: float = field(default_factory=time.time)
@@ -104,16 +113,68 @@ class BotRun:
             "resolution": self.resolution,
             "pollInterval": self.poll_interval,
             "executionMode": self.execution_mode,
+            "stopLossPercent": self.stop_loss_percent,
+            "takeProfitPercent": self.take_profit_percent,
             "status": self.status,
             "latestSignal": self.latest_signal,
             "latestPrice": self.latest_price,
+            "position": {
+                "side": self.position_side,
+                "entryPrice": self.entry_price,
+            },
+            "pnl": {
+                "unrealizedPercent": self.unrealized_pnl_percent,
+                "realizedPercent": self.realized_pnl_percent,
+                "totalPercent": self.total_pnl_percent,
+            },
             "executionCount": self.execution_count,
             "lastError": self.last_error,
+            "lastExitReason": self.last_exit_reason,
             "lastExecution": self.last_execution,
             "latestAnalysis": self.latest_analysis,
             "startedAt": self.started_at,
             "updatedAt": self.updated_at,
         }
+
+
+class LocalStateStore:
+    def __init__(self, file_path: str):
+        self.path = Path(file_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def load(self) -> tuple[dict[str, TradeLockerSession], dict[str, BotRun]]:
+        with self._lock:
+            if not self.path.exists():
+                return {}, {}
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return {}, {}
+
+        sessions: dict[str, TradeLockerSession] = {}
+        for session_payload in payload.get("sessions") or []:
+            session = deserialize_session(session_payload)
+            if session:
+                sessions[session.session_id] = session
+
+        runs: dict[str, BotRun] = {}
+        for run_payload in payload.get("runs") or []:
+            run = deserialize_run(run_payload)
+            if run:
+                runs[run.run_id] = run
+        return sessions, runs
+
+    def save(self, sessions: dict[str, TradeLockerSession], runs: dict[str, BotRun]) -> None:
+        payload = {
+            "sessions": [serialize_session_for_storage(session) for session in sessions.values()],
+            "runs": [serialize_run_for_storage(run) for run in runs.values()],
+        }
+        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        temp_path = self.path.with_suffix(".tmp")
+        with self._lock:
+            temp_path.write_text(data, encoding="utf-8")
+            temp_path.replace(self.path)
 
 
 class TradeLockerClient:
@@ -387,11 +448,16 @@ def create_app(
     *,
     trade_client: TradeLockerClient | None = None,
     run_async: bool = True,
+    state_file: str | None = None,
 ) -> Flask:
     app = Flask(__name__)
     client = trade_client or TradeLockerClient()
-    sessions: dict[str, TradeLockerSession] = {}
-    runs: dict[str, BotRun] = {}
+    default_state_file = os.path.join(app.root_path, "data", "state.json")
+    state_store = LocalStateStore(state_file or default_state_file)
+    sessions, runs = state_store.load()
+
+    def persist_state() -> None:
+        state_store.save(sessions, runs)
 
     @app.get("/")
     def index() -> str:
@@ -414,6 +480,7 @@ def create_app(
             return error_response(exc)
 
         sessions[session.session_id] = session
+        persist_state()
         return jsonify(
             {
                 "ok": True,
@@ -436,6 +503,7 @@ def create_app(
             client.list_accounts(session)
         except TradeLockerApiError as exc:
             return error_response(exc)
+        persist_state()
 
         return jsonify({"ok": True, "session": serialize_session(session)})
 
@@ -449,6 +517,7 @@ def create_app(
             accounts = client.list_accounts(session)
         except TradeLockerApiError as exc:
             return error_response(exc)
+        persist_state()
 
         return jsonify({"ok": True, "accounts": accounts})
 
@@ -521,8 +590,21 @@ def create_app(
             fast_period = int(payload.get("fastPeriod") or 5)
             slow_period = int(payload.get("slowPeriod") or 20)
             poll_interval = int(payload.get("pollInterval") or 15)
+            stop_loss_percent = float(payload.get("stopLossPercent") or 0)
+            take_profit_percent = float(payload.get("takeProfitPercent") or 0)
         except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": "Account, quantity, periods, and poll interval must be valid numbers."}), 400
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": (
+                            "Account, quantity, periods, poll interval, stop loss, and take profit "
+                            "must be valid numbers."
+                        ),
+                    }
+                ),
+                400,
+            )
 
         resolution = (payload.get("resolution") or "15m").strip()
 
@@ -536,6 +618,8 @@ def create_app(
             return jsonify({"ok": False, "error": "Use a fast period >= 2 and a slow period larger than the fast period."}), 400
         if poll_interval < 5 or poll_interval > 300:
             return jsonify({"ok": False, "error": "Poll interval must be between 5 and 300 seconds."}), 400
+        if stop_loss_percent < 0 or take_profit_percent < 0:
+            return jsonify({"ok": False, "error": "Stop loss and take profit must be zero or positive."}), 400
 
         run = BotRun(
             run_id=str(uuid4()),
@@ -549,13 +633,16 @@ def create_app(
             resolution=resolution,
             poll_interval=poll_interval,
             execution_mode=execution_mode,
+            stop_loss_percent=stop_loss_percent,
+            take_profit_percent=take_profit_percent,
         )
         runs[run.run_id] = run
+        persist_state()
 
         if run_async:
             worker = threading.Thread(
                 target=run_bot_loop,
-                args=(client, sessions, run),
+                args=(client, sessions, run, persist_state),
                 daemon=True,
             )
             run.worker = worker
@@ -564,9 +651,11 @@ def create_app(
             run.status = "running"
             try:
                 execute_bot_iteration(client, sessions, run)
+                persist_state()
             except TradeLockerApiError as exc:
                 run.status = "error"
                 run.last_error = exc.message
+                persist_state()
 
         return jsonify({"ok": True, "message": "Bot runner started.", "run": run.to_dict()})
 
@@ -581,6 +670,7 @@ def create_app(
         run.stop_event.set()
         run.status = "stopped"
         run.updated_at = time.time()
+        persist_state()
         return jsonify({"ok": True, "message": "Bot runner stopped.", "run": run.to_dict()})
 
     @app.get("/api/bot/status")
@@ -626,20 +716,209 @@ def serialize_session(session: TradeLockerSession) -> dict[str, Any]:
     }
 
 
+def serialize_session_for_storage(session: TradeLockerSession) -> dict[str, Any]:
+    return {
+        "sessionId": session.session_id,
+        "environment": session.environment,
+        "username": session.username,
+        "server": session.server,
+        "accessToken": session.access_token,
+        "refreshToken": session.refresh_token,
+        "accounts": session.accounts,
+        "createdAt": session.created_at,
+        "updatedAt": session.updated_at,
+    }
+
+
+def deserialize_session(payload: dict[str, Any]) -> TradeLockerSession | None:
+    try:
+        return TradeLockerSession(
+            session_id=str(payload["sessionId"]),
+            environment=str(payload["environment"]),
+            username=str(payload["username"]),
+            server=str(payload["server"]),
+            access_token=str(payload["accessToken"]),
+            refresh_token=payload.get("refreshToken"),
+            accounts=list(payload.get("accounts") or []),
+            created_at=float(payload.get("createdAt") or time.time()),
+            updated_at=float(payload.get("updatedAt") or time.time()),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def serialize_run_for_storage(run: BotRun) -> dict[str, Any]:
+    return {
+        "runId": run.run_id,
+        "sessionId": run.session_id,
+        "accountId": run.account_id,
+        "symbol": run.symbol,
+        "strategy": run.strategy,
+        "quantity": run.quantity,
+        "fastPeriod": run.fast_period,
+        "slowPeriod": run.slow_period,
+        "resolution": run.resolution,
+        "pollInterval": run.poll_interval,
+        "executionMode": run.execution_mode,
+        "stopLossPercent": run.stop_loss_percent,
+        "takeProfitPercent": run.take_profit_percent,
+        "status": run.status,
+        "latestSignal": run.latest_signal,
+        "latestPrice": run.latest_price,
+        "positionSide": run.position_side,
+        "entryPrice": run.entry_price,
+        "unrealizedPnlPercent": run.unrealized_pnl_percent,
+        "realizedPnlPercent": run.realized_pnl_percent,
+        "totalPnlPercent": run.total_pnl_percent,
+        "executionCount": run.execution_count,
+        "lastExecutedSignal": run.last_executed_signal,
+        "lastError": run.last_error,
+        "lastExitReason": run.last_exit_reason,
+        "lastExecution": run.last_execution,
+        "latestAnalysis": run.latest_analysis,
+        "startedAt": run.started_at,
+        "updatedAt": run.updated_at,
+    }
+
+
+def deserialize_run(payload: dict[str, Any]) -> BotRun | None:
+    try:
+        run = BotRun(
+            run_id=str(payload["runId"]),
+            session_id=str(payload["sessionId"]),
+            account_id=int(payload["accountId"]),
+            symbol=str(payload["symbol"]),
+            strategy=str(payload.get("strategy") or "moving_average"),
+            quantity=float(payload.get("quantity") or 0.01),
+            fast_period=int(payload.get("fastPeriod") or 5),
+            slow_period=int(payload.get("slowPeriod") or 20),
+            resolution=str(payload.get("resolution") or "15m"),
+            poll_interval=int(payload.get("pollInterval") or 15),
+            execution_mode=str(payload.get("executionMode") or "paper"),
+            stop_loss_percent=max(float(payload.get("stopLossPercent") or 0.0), 0.0),
+            take_profit_percent=max(float(payload.get("takeProfitPercent") or 0.0), 0.0),
+            status=str(payload.get("status") or "stopped"),
+            latest_signal=str(payload.get("latestSignal") or "hold"),
+            latest_price=float(payload["latestPrice"]) if payload.get("latestPrice") is not None else None,
+            position_side=str(payload.get("positionSide") or "flat"),
+            entry_price=float(payload["entryPrice"]) if payload.get("entryPrice") is not None else None,
+            unrealized_pnl_percent=float(payload.get("unrealizedPnlPercent") or 0.0),
+            realized_pnl_percent=float(payload.get("realizedPnlPercent") or 0.0),
+            total_pnl_percent=float(payload.get("totalPnlPercent") or 0.0),
+            execution_count=int(payload.get("executionCount") or 0),
+            last_executed_signal=payload.get("lastExecutedSignal"),
+            last_error=payload.get("lastError"),
+            last_exit_reason=payload.get("lastExitReason"),
+            last_execution=payload.get("lastExecution"),
+            latest_analysis=payload.get("latestAnalysis"),
+            started_at=float(payload.get("startedAt") or time.time()),
+            updated_at=float(payload.get("updatedAt") or time.time()),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if run.status in {"running", "starting"}:
+        run.status = "stopped"
+        run.last_error = run.last_error or "Run restored from disk in stopped state."
+    if run.position_side not in {"buy", "sell", "flat"}:
+        run.position_side = "flat"
+        run.entry_price = None
+    update_unrealized_pnl(run)
+    return run
+
+
+def calculate_position_pnl_percent(side: str, entry_price: float, current_price: float) -> float:
+    if entry_price == 0:
+        return 0.0
+    raw_move = ((current_price - entry_price) / entry_price) * 100
+    return raw_move if side == "buy" else -raw_move
+
+
+def update_unrealized_pnl(run: BotRun) -> None:
+    if run.position_side not in {"buy", "sell"} or run.entry_price is None or run.latest_price is None:
+        run.unrealized_pnl_percent = 0.0
+    else:
+        run.unrealized_pnl_percent = round(
+            calculate_position_pnl_percent(run.position_side, run.entry_price, run.latest_price),
+            5,
+        )
+    run.total_pnl_percent = round(run.realized_pnl_percent + run.unrealized_pnl_percent, 5)
+
+
+def position_targets_hit(run: BotRun) -> tuple[bool, bool]:
+    if run.position_side not in {"buy", "sell"} or run.entry_price is None or run.latest_price is None:
+        return False, False
+    pnl_percent = calculate_position_pnl_percent(run.position_side, run.entry_price, run.latest_price)
+    hit_stop_loss = run.stop_loss_percent > 0 and pnl_percent <= -run.stop_loss_percent
+    hit_take_profit = run.take_profit_percent > 0 and pnl_percent >= run.take_profit_percent
+    return hit_stop_loss, hit_take_profit
+
+
+def close_position(run: BotRun, reason: str, *, order_id: int | None, side: str) -> None:
+    closed_pnl_percent = 0.0
+    if run.position_side in {"buy", "sell"} and run.entry_price is not None and run.latest_price is not None:
+        closed_pnl_percent = calculate_position_pnl_percent(run.position_side, run.entry_price, run.latest_price)
+    run.realized_pnl_percent = round(run.realized_pnl_percent + closed_pnl_percent, 5)
+    run.position_side = "flat"
+    run.entry_price = None
+    run.execution_count += 1
+    run.last_executed_signal = side
+    run.last_exit_reason = reason
+    run.last_execution = {
+        "side": side,
+        "mode": run.execution_mode,
+        "orderId": order_id,
+        "price": run.latest_price,
+        "timestamp": time.time(),
+        "reason": reason,
+        "closedPnlPercent": round(closed_pnl_percent, 5),
+    }
+    update_unrealized_pnl(run)
+    run.updated_at = time.time()
+
+
+def open_or_reverse_position(run: BotRun, signal: str, *, order_id: int | None) -> None:
+    closed_pnl_percent = 0.0
+    if run.position_side in {"buy", "sell"} and run.entry_price is not None and run.latest_price is not None:
+        closed_pnl_percent = calculate_position_pnl_percent(run.position_side, run.entry_price, run.latest_price)
+        run.realized_pnl_percent = round(run.realized_pnl_percent + closed_pnl_percent, 5)
+
+    run.position_side = signal
+    run.entry_price = run.latest_price
+    run.execution_count += 1
+    run.last_executed_signal = signal
+    run.last_exit_reason = None
+    run.last_execution = {
+        "side": signal,
+        "mode": run.execution_mode,
+        "orderId": order_id,
+        "price": run.latest_price,
+        "timestamp": time.time(),
+        "reason": "signal_change",
+        "closedPnlPercent": round(closed_pnl_percent, 5),
+    }
+    update_unrealized_pnl(run)
+    run.updated_at = time.time()
+
+
 def run_bot_loop(
     client: TradeLockerClient,
     sessions: dict[str, TradeLockerSession],
     run: BotRun,
+    persist_state: Callable[[], None],
 ) -> None:
     run.status = "running"
     run.updated_at = time.time()
+    persist_state()
     while not run.stop_event.is_set():
         try:
             execute_bot_iteration(client, sessions, run)
+            persist_state()
         except TradeLockerApiError as exc:
             run.status = "error"
             run.last_error = exc.message
             run.updated_at = time.time()
+            persist_state()
             return
 
         if run.stop_event.wait(run.poll_interval):
@@ -648,6 +927,7 @@ def run_bot_loop(
     if run.status != "error":
         run.status = "stopped"
         run.updated_at = time.time()
+        persist_state()
 
 
 def execute_bot_iteration(
@@ -681,11 +961,30 @@ def execute_bot_iteration(
         "slowAverage": round(slow_average, 5),
         "barsAnalyzed": len(close_values),
     }
+    update_unrealized_pnl(run)
     run.updated_at = time.time()
 
-    if signal == "hold" or signal == run.last_executed_signal:
+    if run.position_side in {"buy", "sell"} and run.entry_price is not None:
+        hit_stop_loss, hit_take_profit = position_targets_hit(run)
+        if hit_stop_loss or hit_take_profit:
+            close_reason = "stop_loss" if hit_stop_loss else "take_profit"
+            close_side = "sell" if run.position_side == "buy" else "buy"
+            order_id = None
+            if run.execution_mode == "live":
+                order_id = client.place_market_order(
+                    session=session,
+                    account_id=run.account_id,
+                    symbol=run.symbol,
+                    quantity=run.quantity,
+                    side=close_side,
+                )
+            close_position(run, close_reason, order_id=order_id, side=close_side)
+            return
+
+    if signal == "hold" or signal == run.position_side:
         return
 
+    order_id = None
     if run.execution_mode == "live":
         order_id = client.place_market_order(
             session=session,
@@ -694,18 +993,7 @@ def execute_bot_iteration(
             quantity=run.quantity,
             side=signal,
         )
-    else:
-        order_id = None
-
-    run.execution_count += 1
-    run.last_executed_signal = signal
-    run.last_execution = {
-        "side": signal,
-        "mode": run.execution_mode,
-        "orderId": order_id,
-        "price": run.latest_price,
-        "timestamp": time.time(),
-    }
+    open_or_reverse_position(run, signal, order_id=order_id)
 
 
 def summarize_replay_csv(content: bytes) -> ReplaySummary:

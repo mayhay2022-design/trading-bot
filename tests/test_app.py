@@ -1,4 +1,6 @@
 import io
+import os
+import tempfile
 import unittest
 
 from app import TradeLockerSession, create_app
@@ -92,6 +94,8 @@ class AppTestCase(unittest.TestCase):
                 "slowPeriod": 5,
                 "resolution": "15m",
                 "pollInterval": 15,
+                "stopLossPercent": 1.5,
+                "takeProfitPercent": 3.0,
             },
         )
 
@@ -101,6 +105,10 @@ class AppTestCase(unittest.TestCase):
         self.assertEqual(body["run"]["status"], "running")
         self.assertEqual(body["run"]["latestSignal"], "buy")
         self.assertEqual(body["run"]["executionCount"], 1)
+        self.assertEqual(body["run"]["stopLossPercent"], 1.5)
+        self.assertEqual(body["run"]["takeProfitPercent"], 3.0)
+        self.assertEqual(body["run"]["position"]["side"], "buy")
+        self.assertEqual(body["run"]["pnl"]["totalPercent"], 0.0)
         self.assertEqual(body["run"]["lastExecution"]["mode"], "paper")
 
     def test_bot_start_live_mode_places_order(self):
@@ -127,6 +135,8 @@ class AppTestCase(unittest.TestCase):
                 "slowPeriod": 5,
                 "resolution": "15m",
                 "pollInterval": 15,
+                "stopLossPercent": 0,
+                "takeProfitPercent": 0,
             },
         )
 
@@ -152,6 +162,53 @@ class AppTestCase(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["rows"], 2)
         self.assertEqual(body["pnlPercent"], 10.0)
+
+    def test_sessions_and_runs_persist_between_app_instances(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_file = os.path.join(tmp_dir, "state.json")
+            app_one = create_app(trade_client=self.fake_client, run_async=False, state_file=state_file)
+            app_one.testing = True
+            client_one = app_one.test_client()
+
+            client_one.post(
+                "/api/tradelocker/session",
+                json={
+                    "environment": "demo",
+                    "username": "user@example.com",
+                    "password": "secret",
+                    "server": "demo-server",
+                },
+            )
+            start_response = client_one.post(
+                "/api/bot/start",
+                json={
+                    "sessionId": "session-123",
+                    "accountId": 101,
+                    "symbol": "EURUSD",
+                    "strategy": "moving_average",
+                    "executionMode": "paper",
+                    "quantity": 0.01,
+                    "fastPeriod": 3,
+                    "slowPeriod": 5,
+                    "resolution": "15m",
+                    "pollInterval": 15,
+                    "stopLossPercent": 1.0,
+                    "takeProfitPercent": 2.0,
+                },
+            )
+            run_id = start_response.get_json()["run"]["runId"]
+
+            app_two = create_app(trade_client=self.fake_client, run_async=False, state_file=state_file)
+            app_two.testing = True
+            client_two = app_two.test_client()
+
+            session_response = client_two.get("/api/tradelocker/session/session-123")
+            run_response = client_two.get(f"/api/bot/status?runId={run_id}")
+
+            self.assertEqual(session_response.status_code, 200)
+            self.assertEqual(run_response.status_code, 200)
+            self.assertEqual(run_response.get_json()["run"]["stopLossPercent"], 1.0)
+            self.assertEqual(run_response.get_json()["run"]["takeProfitPercent"], 2.0)
 
 
 if __name__ == "__main__":

@@ -58,3 +58,19 @@ button {
     padding: 12px;
     min-height: 64px;
 }
+
+.actions {
+    margin: 12px 0;
+}
+
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px 12px;
+    margin-bottom: 12px;
+}
+
+.summary-grid p {
+    margin: 0;
+    font-size: 14px;
+}

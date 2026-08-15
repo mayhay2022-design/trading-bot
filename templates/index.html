@@ -65,10 +65,19 @@
                     </select>
                 </label>
                 <label>Poll interval seconds <input type="number" name="pollInterval" min="5" max="300" step="1" value="15" required></label>
+                <label>Stop-loss % (0 disables) <input type="number" name="stopLossPercent" min="0" step="0.01" value="0"></label>
+                <label>Take-profit % (0 disables) <input type="number" name="takeProfitPercent" min="0" step="0.01" value="0"></label>
                 <button type="submit">Start bot</button>
             </form>
             <div class="actions">
                 <button id="stop-bot" type="button" disabled>Stop bot</button>
+            </div>
+            <div class="summary-grid">
+                <p><strong>Position:</strong> <span id="summary-position">flat</span></p>
+                <p><strong>Entry:</strong> <span id="summary-entry">-</span></p>
+                <p><strong>Last price:</strong> <span id="summary-price">-</span></p>
+                <p><strong>Unrealized P&amp;L %:</strong> <span id="summary-unrealized">0.00000%</span></p>
+                <p><strong>Total P&amp;L %:</strong> <span id="summary-total">0.00000%</span></p>
             </div>
             <pre id="bot-result" class="result"></pre>
         </section>
@@ -99,6 +108,26 @@
 
         function renderResult(id, payload) {
             document.getElementById(id).textContent = JSON.stringify(payload, null, 2);
+            if (id === 'bot-result') {
+                updateBotSummary(payload.run || null);
+            }
+        }
+
+        function formatNumber(value, digits = 5, suffix = '') {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) {
+                return '-';
+            }
+            return `${Number(value).toFixed(digits)}${suffix}`;
+        }
+
+        function updateBotSummary(run) {
+            const position = run?.position || {};
+            const pnl = run?.pnl || {};
+            document.getElementById('summary-position').textContent = position.side || 'flat';
+            document.getElementById('summary-entry').textContent = formatNumber(position.entryPrice);
+            document.getElementById('summary-price').textContent = formatNumber(run?.latestPrice);
+            document.getElementById('summary-unrealized').textContent = formatNumber(pnl.unrealizedPercent || 0, 5, '%');
+            document.getElementById('summary-total').textContent = formatNumber(pnl.totalPercent || 0, 5, '%');
         }
 
         function setAccounts(accounts) {

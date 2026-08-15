@@ -6,8 +6,11 @@ A minimal Python website that creates a TradeLocker session, lets you choose an 
 
 - TradeLocker session and account loading
 - Bot start, stop, and status flow
+- Stop-loss and take-profit controls for bot runs
+- Position and P&L status display
 - Moving-average trading logic using TradeLocker market history
 - FX Replay CSV import and summary metrics
+- Persistent local storage for TradeLocker sessions and bot runs
 - Lightweight Flask UI
 - Basic automated endpoint tests
 
@@ -44,7 +47,7 @@ Then open `http://127.0.0.1:5000`.
 ## TradeLocker setup
 
 - Enter your TradeLocker username, password, server, and environment in the UI
-- The app stores tokens only in memory for the current Flask process
+- The app stores tokens and run state in a local `data/state.json` file for persistence across restarts
 - If your broker requires it, set `TRADELOCKER_DEVELOPER_API_KEY` before starting the app
 
 ## Bot workflow
