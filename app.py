@@ -166,13 +166,13 @@ class LocalStateStore:
         return sessions, runs
 
     def save(self, sessions: dict[str, TradeLockerSession], runs: dict[str, BotRun]) -> None:
-        payload = {
-            "sessions": [serialize_session_for_storage(session) for session in sessions.values()],
-            "runs": [serialize_run_for_storage(run) for run in runs.values()],
-        }
-        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        temp_path = self.path.with_suffix(".tmp")
         with self._lock:
+            payload = {
+                "sessions": [serialize_session_for_storage(session) for session in sessions.values()],
+                "runs": [serialize_run_for_storage(run) for run in runs.values()],
+            }
+            data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+            temp_path = self.path.with_suffix(".tmp")
             temp_path.write_text(data, encoding="utf-8")
             temp_path.replace(self.path)
 
@@ -590,8 +590,10 @@ def create_app(
             fast_period = int(payload.get("fastPeriod") or 5)
             slow_period = int(payload.get("slowPeriod") or 20)
             poll_interval = int(payload.get("pollInterval") or 15)
-            stop_loss_percent = float(payload.get("stopLossPercent") or 0)
-            take_profit_percent = float(payload.get("takeProfitPercent") or 0)
+            stop_loss_value = payload.get("stopLossPercent", 0)
+            take_profit_value = payload.get("takeProfitPercent", 0)
+            stop_loss_percent = float(0 if stop_loss_value is None else stop_loss_value)
+            take_profit_percent = float(0 if take_profit_value is None else take_profit_value)
         except (TypeError, ValueError):
             return (
                 jsonify(
@@ -819,7 +821,6 @@ def deserialize_run(payload: dict[str, Any]) -> BotRun | None:
 
     if run.status in {"running", "starting"}:
         run.status = "stopped"
-        run.last_error = run.last_error or "Run restored from disk in stopped state."
     if run.position_side not in {"buy", "sell", "flat"}:
         run.position_side = "flat"
         run.entry_price = None
