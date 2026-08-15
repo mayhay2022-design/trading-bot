@@ -1,0 +1,60 @@
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+}
+
+.container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 32px 16px 48px;
+}
+
+.hero {
+    margin-bottom: 24px;
+}
+
+.card {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+form {
+    display: grid;
+    gap: 12px;
+}
+
+label {
+    display: grid;
+    gap: 6px;
+    font-size: 14px;
+}
+
+input,
+select,
+button {
+    border-radius: 8px;
+    border: 1px solid #475569;
+    padding: 10px 12px;
+    font-size: 14px;
+}
+
+button {
+    background: #38bdf8;
+    border: none;
+    color: #082f49;
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.result {
+    white-space: pre-wrap;
+    background: #020617;
+    border-radius: 8px;
+    padding: 12px;
+    min-height: 64px;
+}

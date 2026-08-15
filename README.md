@@ -1,83 +1,52 @@
-# TradeLocker Trading Bot
+# Trading Bot Test Website
 
-A comprehensive Python-based trading bot for the TradeLocker platform with advanced strategies, backtesting, and risk management.
+A minimal Python website for testing a trading bot workflow with TradeLocker connectivity and FX Replay CSV-based replay evaluation.
 
 ## Features
 
-✅ **TradeLocker API Integration** - Full platform connectivity  
-✅ **Technical Indicators** - MA, RSI, MACD, Bollinger Bands, Stochastic  
-✅ **Backtesting Engine** - Extensive testing with performance metrics  
-✅ **Multiple Strategies** - Trend-following, mean reversion, RSI+MACD combo  
-✅ **Risk Management** - Stop-loss, take-profit, position sizing, drawdown protection  
-✅ **Real-time Monitoring** - Live execution, alerts, P&L tracking  
-✅ **85%+ Win Rate Target** - Iterative optimization and validation  
+- TradeLocker login connectivity check
+- Bot test configuration form
+- FX Replay CSV import and summary metrics
+- Lightweight Flask UI
+- Basic automated endpoint tests
 
 ## Project Structure
 
 ```
 trading-bot/
-├── src/
-│   ├── tradelocker_api.py      # TradeLocker API wrapper
-│   ├── indicators.py            # Technical indicators library
-│   ├── strategies.py            # Trading strategy implementations
-│   ├── backtester.py            # Backtesting engine
-│   ├── risk_manager.py          # Risk management module
-│   ├── trading_engine.py        # Main execution engine
-│   └── data_handler.py          # Historical data management
-├── config/
-│   ├── config.json              # Configuration template
-│   └── strategies_config.json    # Strategy parameters
-├── tests/
-│   ├── test_indicators.py       # Indicator tests
-│   ├── test_strategies.py       # Strategy tests
-│   └── test_backtester.py       # Backtester tests
-├── backtest_results/            # Backtest output reports
-├── requirements.txt             # Python dependencies
-├── setup.py                     # Package setup
-└── main.py                      # Entry point
+├── app.py
+├── requirements.txt
+├── static/
+│   └── styles.css
+├── templates/
+│   └── index.html
+└── tests/
+    └── test_app.py
 ```
 
 ## Installation
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Configure your TradeLocker API credentials in `config/config.json`
-4. Run backtests or start live trading
-
-## Usage
-
-### Backtesting
 ```bash
-python main.py --backtest --strategy rsi_macd --start-date 2024-01-01 --end-date 2024-12-31
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### Live Trading
+## Run the website
+
 ```bash
-python main.py --live --strategy rsi_macd
+python app.py
 ```
 
-## Strategies
+Then open `http://127.0.0.1:5000`.
 
-- **RSI + MACD Combo** - Target: 85%+ win rate
-- **Trend Following** - Moving average crossovers
-- **Mean Reversion** - Bollinger Bands based
-- **Volatility Based** - ATR and breakout strategy
+## Test
 
-## Performance Metrics
+```bash
+python -m pytest
+```
 
-- Win Rate
-- Profit Factor
-- Sharpe Ratio
-- Maximum Drawdown
-- Return on Investment (ROI)
+## Notes
 
-## Contributing
-
-See CONTRIBUTING.md for guidelines.
-
-## License
-
-MIT License
+- TradeLocker is tested through its login API using credentials you provide in the UI.
+- FX Replay does not currently expose a public API for direct third-party app control, so this starter site uses CSV exports from FX Replay instead.

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Bot Test Console</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="container">
+        <section class="hero">
+            <h1>Trading Bot Test Console</h1>
+            <p>Use this starter website to validate TradeLocker connectivity, stage bot test runs, and evaluate FX Replay CSV exports.</p>
+        </section>
+
+        <section class="card">
+            <h2>1. TradeLocker connection test</h2>
+            <form id="tradelocker-form">
+                <label>Environment
+                    <select name="environment">
+                        <option value="demo">Demo</option>
+                        <option value="live">Live</option>
+                    </select>
+                </label>
+                <label>Username <input type="email" name="username" required></label>
+                <label>Password <input type="password" name="password" required></label>
+                <label>Server <input type="text" name="server" required></label>
+                <button type="submit">Test TradeLocker</button>
+            </form>
+            <pre id="tradelocker-result" class="result"></pre>
+        </section>
+
+        <section class="card">
+            <h2>2. Bot test setup</h2>
+            <form id="bot-form">
+                <label>Strategy
+                    <select name="strategy">
+                        <option value="rsi_macd">RSI + MACD</option>
+                        <option value="trend_following">Trend Following</option>
+                        <option value="mean_reversion">Mean Reversion</option>
+                    </select>
+                </label>
+                <label>Symbol <input type="text" name="symbol" value="EURUSD" required></label>
+                <label>Source
+                    <select name="source">
+                        <option value="TradeLocker">TradeLocker</option>
+                        <option value="FX Replay CSV">FX Replay CSV</option>
+                    </select>
+                </label>
+                <label>Risk % <input type="number" name="riskPercent" min="0.1" max="10" step="0.1" value="1"></label>
+                <button type="submit">Save test run</button>
+            </form>
+            <pre id="bot-result" class="result"></pre>
+        </section>
+
+        <section class="card">
+            <h2>3. FX Replay import workflow</h2>
+            <p id="fxreplay-status">Checking FX Replay support...</p>
+            <form id="fxreplay-form">
+                <label>Strategy
+                    <input type="text" name="strategy" value="rsi_macd" required>
+                </label>
+                <label>Symbol
+                    <input type="text" name="symbol" value="EURUSD" required>
+                </label>
+                <label>Replay CSV export
+                    <input type="file" name="file" accept=".csv" required>
+                </label>
+                <button type="submit">Process replay CSV</button>
+            </form>
+            <pre id="fxreplay-result" class="result"></pre>
+        </section>
+    </main>
+
+    <script>
+        async function sendJson(formId, url, resultId) {
+            const form = document.getElementById(formId);
+            form.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const data = Object.fromEntries(new FormData(form).entries());
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data),
+                });
+                const body = await response.json();
+                document.getElementById(resultId).textContent = JSON.stringify(body, null, 2);
+            });
+        }
+
+        sendJson('tradelocker-form', '/api/tradelocker/test', 'tradelocker-result');
+        sendJson('bot-form', '/api/bot/test', 'bot-result');
+
+        document.getElementById('fxreplay-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const form = document.getElementById('fxreplay-form');
+            const response = await fetch('/api/fxreplay/test', {
+                method: 'POST',
+                body: new FormData(form),
+            });
+            const body = await response.json();
+            document.getElementById('fxreplay-result').textContent = JSON.stringify(body, null, 2);
+        });
+
+        fetch('/api/fxreplay/status')
+            .then((response) => response.json())
+            .then((body) => {
+                document.getElementById('fxreplay-status').textContent = body.message;
+            });
+    </script>
+</body>
+</html>
