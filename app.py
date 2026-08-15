@@ -60,7 +60,7 @@ def create_app() -> Flask:
         ).encode("utf-8")
 
         login_request = request.Request(
-            f"{TRADELOCKER_BASE_URLS[environment]}/auth/jwt/all",
+            f"{TRADELOCKER_BASE_URLS[environment]}/auth/login",
             data=login_payload,
             headers={
                 "Content-Type": "application/json",
